@@ -2015,6 +2015,8 @@ struct ssl_func {
 #define BN_free (*(void (*)(const BIGNUM *a))crypto_sw[13].ptr)
 #define CRYPTO_free (*(void (*)(void *addr))crypto_sw[14].ptr)
 #define ERR_clear_error (*(void (*)(void))crypto_sw[15].ptr)
+#define X509_VERIFY_PARAM_set_hostflags (*(void (*)(X509_VERIFY_PARAM *param, unsigned int flags))crypto_sw[16].ptr)
+#define X509_VERIFY_PARAM_set1_host (*(int (*)(X509_VERIFY_PARAM *param, const char *name, size_t namelen))crypto_sw[17].ptr)
 
 #define OPENSSL_free(a) CRYPTO_free(a)
 
@@ -2063,6 +2065,8 @@ static struct ssl_func ssl_sw[] = {{"SSL_free", NULL},
                                    {"SSL_get_servername", NULL},
                                    {"SSL_set_SSL_CTX", NULL},
                                    {"SSL_ctrl", NULL},
+								   {"SSL_CTX_clear_options", NULL },
+								   {"SSL_CTX_get0_param", NULL},
                                    {NULL, NULL}};
 
 
@@ -2084,6 +2088,8 @@ static struct ssl_func crypto_sw[] = {{"ERR_get_error", NULL},
                                       {"BN_free", NULL},
                                       {"CRYPTO_free", NULL},
                                       {"ERR_clear_error", NULL},
+									  {"X509_VERIFY_PARAM_set_hostflags", NULL},
+									  {"X509_VERIFY_PARAM_set1_host", NULL},
                                       {NULL, NULL}};
 #else /* OPENSSL_API_1_1 */
 /* OpenSSL <1.1 */
@@ -2205,6 +2211,25 @@ static struct ssl_func crypto_sw[] = {{"ERR_get_error", NULL},
 #define CRYPTO_free (*(void (*)(void *addr))crypto_sw[23].ptr)
 #define ERR_clear_error (*(void (*)(void))crypto_sw[24].ptr)
 
+/* for host name verification in OpenSSL 1.0.x only */
+/* - libssl, from offset 39 */
+#define SSL_get_ex_data_X509_STORE_CTX_idx (*(int (*)(void))ssl_sw[39].ptr)
+/* - libcrypto, from offset 25 */
+#define ASN1_STRING_data (*(unsigned char *(*)(ASN1_STRING *))crypto_sw[25].ptr)
+#define ASN1_STRING_length (*(int (*)(const ASN1_STRING *))crypto_sw[26].ptr)
+#define X509_get_ext_d2i (*(void *(*)(X509 *, int, int *, int *))crypto_sw[27].ptr)
+#define X509_NAME_ENTRY_get_data (*(ASN1_STRING *(*)(X509_NAME_ENTRY *))crypto_sw[28].ptr)
+#define X509_NAME_get_entry (*(X509_NAME_ENTRY *(*)(X509_NAME *name, int loc))crypto_sw[29].ptr)
+#define X509_STORE_CTX_get_error_depth (*(int (*)(X509_STORE_CTX *ctx))crypto_sw[30].ptr)
+#define X509_NAME_get_index_by_NID (*(int (*)(X509_NAME *name, int nid, int lastpos))crypto_sw[31].ptr)
+#define X509_STORE_CTX_get_current_cert (*(X509 *(*)(X509_STORE_CTX *ctx))crypto_sw[32].ptr)
+#define X509_STORE_CTX_get_ex_data (*(void *(*)(X509_STORE_CTX *ctx, int idx))crypto_sw[33].ptr)
+#define sk_pop_free (*(void (*)(_STACK *, void (*) (void *)))crypto_sw[34].ptr)
+#define sk_num (*(int (*)(const _STACK *))crypto_sw[35].ptr)
+#define sk_value (*(void *(*)(const _STACK *, int))crypto_sw[36].ptr)
+#define GENERAL_NAME_free_impl (*(void (*)(GENERAL_NAME *))crypto_sw[37].ptr)
+#define ASN1_STRING_to_UTF8 (*(int (*)(unsigned char **out, ASN1_STRING *in))crypto_sw[38].ptr)
+
 #define OPENSSL_free(a) CRYPTO_free(a)
 
 /* use here ERR_remove_state,
@@ -2255,6 +2280,8 @@ static struct ssl_func ssl_sw[] = {{"SSL_free", NULL},
                                    {"SSL_get_servername", NULL},
                                    {"SSL_set_SSL_CTX", NULL},
                                    {"SSL_ctrl", NULL},
+								   /* for host name verification in OpenSSL 1.0.x only */
+								   {"SSL_get_ex_data_X509_STORE_CTX_idx", NULL},
                                    {NULL, NULL}};
 
 
@@ -2285,6 +2312,21 @@ static struct ssl_func crypto_sw[] = {{"CRYPTO_num_locks", NULL},
                                       {"BN_free", NULL},
                                       {"CRYPTO_free", NULL},
                                       {"ERR_clear_error", NULL},
+									  /* for host name verification in OpenSSL 1.0.x only */
+									  {"ASN1_STRING_data", NULL},
+									  {"ASN1_STRING_length", NULL},
+									  {"X509_get_ext_d2i", NULL},
+									  {"X509_NAME_ENTRY_get_data", NULL},
+									  {"X509_NAME_get_entry", NULL},
+									  {"X509_STORE_CTX_get_error_depth", NULL},
+									  {"X509_NAME_get_index_by_NID", NULL},
+									  {"X509_STORE_CTX_get_current_cert", NULL},
+									  {"X509_STORE_CTX_get_ex_data", NULL},
+									  {"sk_pop_free", NULL},
+									  {"sk_num", NULL},
+									  {"sk_value", NULL},
+									  {"GENERAL_NAME_free", NULL},
+									  {"ASN1_STRING_to_UTF8", NULL},
                                       {NULL, NULL}};
 #endif /* OPENSSL_API_1_1 */
 #endif /* NO_SSL_DL */
@@ -16796,6 +16838,80 @@ mg_close_connection(struct mg_connection *conn)
 }
 
 
+/* Only for memory statistics */
+static struct mg_context common_client_context;
+
+
+#if !defined(NO_SSL)
+#ifndef OPENSSL_API_1_1
+
+/* pre-OpenSSL 1.1 cannot do host name verification automatically */
+#include "openssl_hostname_validation.inl"
+
+#if defined(DEBUG)
+
+/* This prints the Common Name (CN), which is the "friendly" */
+/*	 name displayed to users in many tools					 */
+void print_cn_name(const char* label, X509_NAME* const name)
+{
+  int idx = -1, success = 0;
+  unsigned char *utf8 = NULL;
+
+  do
+  {
+	if(!name) break; /* failed */
+
+	idx = X509_NAME_get_index_by_NID(name, NID_commonName, -1);
+	if(!(idx > -1))	 break; /* failed */
+
+	X509_NAME_ENTRY* entry = X509_NAME_get_entry(name, idx);
+	if(!entry) break; /* failed */
+
+	ASN1_STRING* data = X509_NAME_ENTRY_get_data(entry);
+	if(!data) break; /* failed */
+
+	int length = ASN1_STRING_to_UTF8(&utf8, data);
+	if(!utf8 || !(length > 0))	break; /* failed */
+
+	fprintf(stdout, "%s: %s\n", label, utf8);
+	success = 1;
+
+  } while (0);
+
+  if(utf8)
+	OPENSSL_free(utf8);
+
+  if(!success)
+	fprintf(stdout, "  %s: <not available>\n", label);
+}
+
+#endif /* DEBUG enabled */
+
+
+int verify_callback(int preverify, X509_STORE_CTX* x509_ctx)
+{
+  int depth = X509_STORE_CTX_get_error_depth(x509_ctx);
+#if defined(DEBUG)
+  X509* cert = X509_STORE_CTX_get_current_cert(x509_ctx);
+  X509_NAME* iname = cert ? X509_get_issuer_name(cert) : NULL;
+  X509_NAME* sname = cert ? X509_get_subject_name(cert) : NULL;
+  print_cn_name("Issuer (cn)", iname);
+  print_cn_name("Subject (cn)", sname);
+#endif
+  if (depth==0 && preverify==1) {
+	/*	this is the server cert */
+	const SSL *ssl = X509_STORE_CTX_get_ex_data(x509_ctx, SSL_get_ex_data_X509_STORE_CTX_idx());
+	struct mg_connection *conn = (struct mg_connection *)SSL_get_app_data(ssl);
+	X509* cert = X509_STORE_CTX_get_current_cert(x509_ctx);
+	preverify = validate_hostname(conn->clienthost, cert)==MatchFound;
+  }
+  return preverify;
+}
+
+#endif /* !OPENSSL_API_1_1 */
+#endif /* SSL enabled */
+
+
 static struct mg_connection *
 mg_connect_client_impl(const struct mg_client_options *client_options,
                        int use_ssl,
@@ -16807,6 +16923,7 @@ mg_connect_client_impl(const struct mg_client_options *client_options,
 	union usa sa;
 	struct sockaddr *psa;
 	socklen_t len;
+	int res;
 
 	unsigned max_req_size =
 	    (unsigned)atoi(config_options[MAX_REQUEST_SIZE].default_value);
@@ -16815,9 +16932,8 @@ mg_connect_client_impl(const struct mg_client_options *client_options,
 	size_t conn_size = ((sizeof(struct mg_connection) + 7) >> 3) << 3;
 	size_t ctx_size = ((sizeof(struct mg_context) + 7) >> 3) << 3;
 
-	conn =
-	    (struct mg_connection *)mg_calloc(1,
-	                                      conn_size + ctx_size + max_req_size);
+	conn = (struct mg_connection *)mg_calloc_ctx(
+		1, conn_size + ctx_size + max_req_size, &common_client_context);
 
 	if (conn == NULL) {
 		mg_snprintf(NULL,
@@ -16845,6 +16961,7 @@ mg_connect_client_impl(const struct mg_client_options *client_options,
 	conn->buf_size = (int)max_req_size;
 	conn->phys_ctx->context_type = CONTEXT_HTTP_CLIENT;
 	conn->dom_ctx = &(conn->phys_ctx->dd);
+	conn->dom_ctx->ssl_ctx = NULL;
 
 	if (!connect_socket(conn->phys_ctx,
 	                    client_options->host,
@@ -16932,6 +17049,8 @@ mg_connect_client_impl(const struct mg_client_options *client_options,
 
 #if !defined(NO_SSL)
 	if (use_ssl) {
+		common_client_context.dd.ssl_ctx = conn->dom_ctx->ssl_ctx;
+
 		/* TODO: Check ssl_verify_peer and ssl_ca_path here.
 		 * SSL_CTX_set_verify call is needed to switch off server
 		 * certificate checking, which is off by default in OpenSSL and
@@ -16948,7 +17067,7 @@ mg_connect_client_impl(const struct mg_client_options *client_options,
 				            NULL, /* No truncation check for ebuf */
 				            ebuf,
 				            ebuf_len,
-				            "Can not use SSL client certificate");
+							"Can not use SSL client certificate: %s", ERR_error_string(ERR_get_error(), NULL));
 				SSL_CTX_free(conn->dom_ctx->ssl_ctx);
 				closesocket(sock);
 				mg_free(conn);
@@ -16957,19 +17076,56 @@ mg_connect_client_impl(const struct mg_client_options *client_options,
 		}
 
 		if (client_options->server_cert) {
-			if (SSL_CTX_load_verify_locations(conn->dom_ctx->ssl_ctx,
-			                                  client_options->server_cert,
-			                                  NULL)
-			    != 1) {
-				mg_cry_internal(conn,
-				                "SSL_CTX_load_verify_locations error: %s ",
-				                ssl_error());
-				SSL_CTX_free(conn->dom_ctx->ssl_ctx);
-				closesocket(sock);
-				mg_free(conn);
-				return NULL;
+			if (strcmp(client_options->server_cert, "*")==0) {
+				/*	use default verification */
+				if (SSL_CTX_set_default_verify_paths(conn->dom_ctx->ssl_ctx)!=1) {
+					mg_snprintf(NULL,
+								NULL, /* No truncation check for ebuf */
+								ebuf,
+								ebuf_len,
+								"Error using default certificate verify paths: %s", ERR_error_string(ERR_get_error(), NULL));
+					SSL_CTX_free(conn->dom_ctx->ssl_ctx);
+					closesocket(sock);
+					mg_free(conn);
+					return NULL;
+				}
 			}
+			else {
+				if (client_options->server_cert[0]=='=') {
+					/*	special syntax for specifying a CAFile: prefix with "=" */
+					res = SSL_CTX_load_verify_locations(conn->dom_ctx->ssl_ctx,
+														client_options->server_cert+1, /*  CAFile prefixed with "=" */
+														NULL); /*  no CAPath */
+				}
+				else {
+					/*	no special prefix: path passed is a CAPath */
+					res = SSL_CTX_load_verify_locations(conn->dom_ctx->ssl_ctx,
+														NULL, /*  no CAFile */
+														client_options->server_cert); /*  CAPath */
+				}
+				if (res!=1) {
+					mg_snprintf(NULL,
+								NULL, /* No truncation check for ebuf */
+								ebuf,
+								ebuf_len,
+								"Error setting CA file for server certificate verification: %s", ERR_error_string(ERR_get_error(), NULL));
+					SSL_CTX_free(conn->dom_ctx->ssl_ctx);
+					closesocket(sock);
+					mg_free(conn);
+					return NULL;
+				}
+			}
+#ifdef OPENSSL_API_1_1
+			/*	OpenSSL 1.1 can do hostname validation */
+			X509_VERIFY_PARAM *param = SSL_CTX_get0_param(conn->dom_ctx->ssl_ctx);
+			X509_VERIFY_PARAM_set_hostflags(param, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+			X509_VERIFY_PARAM_set1_host(param, client_options->host, 0);
 			SSL_CTX_set_verify(conn->dom_ctx->ssl_ctx, SSL_VERIFY_PEER, NULL);
+#else
+			/* we need to do our own hostname verification, and thus need host in verify_callback */
+			conn->clienthost = client_options->host;
+			SSL_CTX_set_verify(conn->dom_ctx->ssl_ctx, SSL_VERIFY_PEER, verify_callback);
+#endif
 		} else {
 			SSL_CTX_set_verify(conn->dom_ctx->ssl_ctx, SSL_VERIFY_NONE, NULL);
 		}
