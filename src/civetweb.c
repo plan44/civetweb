@@ -11488,7 +11488,7 @@ handle_cgi_request(struct mg_connection *conn, const char *prog)
 	if (cgi_timeout > 0.0) {
 		proc->references = 2;
 
-		// Start a timer for CGI
+		/*	Start a timer for CGI */
 		timer_add(conn->phys_ctx,
 		          cgi_timeout /* in seconds */,
 		          0.0,
@@ -12155,10 +12155,10 @@ do_ssi_exec(struct mg_connection *conn, char *tag)
 		}
 		*sP = 0;
 		if ((file.access.fp = popen(scmd, "r")) == NULL) {
-			mg_cry_internal(conn,
-			                "Cannot SSI #exec: [%s]: %s",
-			                cmd,
-			                strerror(ERRNO));
+		  mg_cry_internal(conn,
+						  "Cannot SSI #exec: [%s]: %s",
+						  cmd,
+						  strerror(ERRNO));
 		} else {
 			send_file_data(conn, &file, 0, INT64_MAX);
 			pclose(file.access.fp);
@@ -12631,7 +12631,7 @@ read_websocket(struct mg_connection *conn,
 	unsigned char mask[4];
 
 	/* data points to the place where the message is stored when passed to
-	 * the websocket_data callback.  This is either mem on the stack, or a
+	 * the websocket_data callback. This is either mem on the stack, or a
 	 * dynamically allocated buffer if it is too large. */
 	unsigned char mem[4096];
 	unsigned char mop; /* mask flag and opcode */
@@ -13125,7 +13125,7 @@ handle_websocket_request(struct mg_connection *conn,
 	/* Step 2: If a callback is responsible, call it. */
 	if (is_callback_resource) {
 		/* Step 2.1 check and select subprotocol */
-		const char *protocols[64]; // max 64 headers
+		const char *protocols[64]; /*  max 64 headers */
 		int nbSubprotocolHeader = get_req_headers(&conn->request_info,
 		                                          "Sec-WebSocket-Protocol",
 		                                          protocols,
@@ -13148,7 +13148,7 @@ handle_websocket_request(struct mg_connection *conn,
 					len = sep ? (unsigned long)(sep - protocol)
 					          : (unsigned long)strlen(protocol);
 					while (sep && isspace((unsigned char)*++sep))
-						; // ignore leading whitespaces
+						; /*  ignore leading whitespaces */
 					protocol = sep;
 
 
@@ -16092,7 +16092,7 @@ initialize_ssl(char *ebuf, size_t ebuf_len)
 			return 0;
 		}
 	}
-#endif /* NO_SSL_DL */
+#endif /* !NO_SSL_DL */
 
 #if defined(OPENSSL_API_1_1)
 	/* Initialize SSL library */
@@ -18576,7 +18576,7 @@ init_connection(struct mg_connection *conn)
 
 /* Process a connection - may handle multiple requests
  * using the same connection.
- * Must be called with a valid connection (conn  and
+ * Must be called with a valid connection (conn	 and
  * conn->phys_ctx must be valid).
  */
 static void
