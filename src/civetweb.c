@@ -12086,6 +12086,7 @@ do_ssi_include(struct mg_connection *conn,
 
 
 #if !defined(NO_POPEN)
+
 static void
 do_ssi_exec(struct mg_connection *conn, char *tag)
 {
@@ -12095,8 +12096,65 @@ do_ssi_exec(struct mg_connection *conn, char *tag)
 	if (sscanf(tag, " \"%1023[^\"]\"", cmd) != 1) {
 		mg_cry_internal(conn, "Bad SSI #exec: [%s]", tag);
 	} else {
-		cmd[1023] = 0;
-		if ((file.access.fp = popen(cmd, "r")) == NULL) {
+		/*	susbstitute $P with path and $Q with query string */
+		char scmd[1024] = "";
+		char *sP = scmd;
+		const char *cP = cmd;
+		size_t room = 1023;
+		while (*cP) {
+			const char *iP = strchr(cP, '$');
+			size_t n;
+			if (iP) {
+				n = iP-cP; if (n>room) n=room;
+				strncpy(sP, cP, n); sP += n; room -= n; cP += n;
+				iP++;
+				if (*iP=='P') {
+					if (conn->request_info.request_uri) {
+						/*	replace $P by request uri */
+						n = strlen(conn->request_info.request_uri); if (n>room) n=room;
+						strncpy(sP, conn->request_info.request_uri, n); sP += n; room -= n;
+					}
+					cP += 2;
+				}
+				else if (*iP=='Q') {
+					if (conn->request_info.query_string) {
+						/* replace $Q by query string
+						 * Note: using this w/o surrounding it by single quotes creates a shell injection
+						 *	 vulnerability. So it is assumed to be in single quotes, and any contained
+						 *	 single quote will be output as '"'"' to prevent breaking out of quoting
+						 */
+						const char *qP = conn->request_info.query_string;
+						size_t i;
+						n = strlen(conn->request_info.query_string); if (n>room) n=room;
+						for (i=0; i<n; i++) {
+							if (*qP=='\'') {
+								// expand single quote such that it can be included in a single quoted shell argument
+								if (room<6) break;
+								strncpy(sP, "'\"'\"'", 5);
+								sP += 5;
+								room -= 4;
+							}
+							else
+								*sP++ = *qP;
+							qP++;
+							room--;
+						}
+					}
+					cP += 2;
+				}
+				else {
+					*(sP++) = '$'; room--;
+					cP++;
+				}
+			}
+			else {
+				n = strlen(cP); if (n>room) n=room;
+				strncpy(sP, cP, n); sP += n; room -= n; cP += n;
+				break;
+			}
+		}
+		*sP = 0;
+		if ((file.access.fp = popen(scmd, "r")) == NULL) {
 			mg_cry_internal(conn,
 			                "Cannot SSI #exec: [%s]: %s",
 			                cmd,
