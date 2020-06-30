@@ -1078,6 +1078,20 @@ CIVETWEB_API long long mg_store_body(struct mg_connection *conn,
      > 0   number of bytes read into the buffer. */
 CIVETWEB_API int mg_read(struct mg_connection *, void *buf, size_t len);
 
+/* timeout can be 0 to just read what's ready right now, -1 to use timeout from config, -2 for no timeout, and >0 for timeout in seconds */
+#define TMO_ZERO (0) /* zero waiting, just return data that is available right now */
+#define TMO_NEVER (-2) /* never timeout, might block indefinitely */
+#define TMO_SOMETHING (-3) /* wait until something is available, then immediately return that something */
+#define TMO_DEFAULT (-1) /* use default timeout from connection */
+/* errCause, when not NULL, will return details about why an error (<0 result) occurred */
+#define EC_NORMAL 0 /* normal error */
+#define EC_CLOSED 1 /* error because peer closed connection */
+#define EC_TIMEOUT 2 /* error due to timeout */
+CIVETWEB_API int mg_read_ex(struct mg_connection *, void *buf, size_t len, double timeout, int *errCause);
+
+
+
+
 
 /* Get the value of particular HTTP header.
 
