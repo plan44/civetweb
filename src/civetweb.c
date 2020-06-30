@@ -1784,7 +1784,7 @@ typedef int socklen_t;
 typedef struct SSL SSL; /* dummy for SSL argument to push/pull */
 typedef struct SSL_CTX SSL_CTX;
 #else
-#if defined(NO_SSL_DL)
+#if defined(NO_SSL_DL) || defined(USE_SSL_HEADERS)
 #include <openssl/bn.h>
 #include <openssl/conf.h>
 #include <openssl/crypto.h>
@@ -1796,12 +1796,13 @@ typedef struct SSL_CTX SSL_CTX;
 #include <openssl/ssl.h>
 #include <openssl/tls1.h>
 #include <openssl/x509.h>
+#include <openssl/x509v3.h>
 
 #if defined(WOLFSSL_VERSION)
 /* Additional defines for WolfSSL, see
  * https://github.com/civetweb/civetweb/issues/583 */
 #include "wolfssl_extras.inl"
-#endif
+#endif /* WOLFSSL_VERSION */
 
 #if defined(OPENSSL_IS_BORINGSSL)
 /* From boringssl/src/include/openssl/mem.h:
@@ -1813,10 +1814,10 @@ typedef struct SSL_CTX SSL_CTX;
  *
  * #define OPENSSL_free free */
 #define free free
-// disable for boringssl
+/*	disable for boringssl */
 #define CONF_modules_unload(a) ((void)0)
 #define ENGINE_cleanup() ((void)0)
-#endif
+#endif /* OPENSSL_IS_BORINGSSL */
 
 #if (OPENSSL_VERSION_NUMBER >= 0x10100000L)
 /* If OpenSSL headers are included, automatically select the API version */
@@ -1828,7 +1829,11 @@ typedef struct SSL_CTX SSL_CTX;
 #define OPENSSL_REMOVE_THREAD_STATE() ERR_remove_thread_state(NULL)
 #endif
 
-#else
+#endif /* NO_SSL_DL || USE_SSL_HEADERS */
+
+#if !defined(NO_SSL_DL)
+
+#if !defined(USE_SSL_HEADERS)
 
 /* SSL loaded dynamically from DLL.
  * I put the prototypes here to be independent from OpenSSL source
@@ -1892,6 +1897,8 @@ typedef struct x509 X509;
 #define SSL_TLSEXT_ERR_ALERT_WARNING (1)
 #define SSL_TLSEXT_ERR_ALERT_FATAL (2)
 #define SSL_TLSEXT_ERR_NOACK (3)
+
+#endif /* !USE_SSL_HEADERS */
 
 struct ssl_func {
 	const char *name;  /* SSL function name */
@@ -2078,7 +2085,8 @@ static struct ssl_func crypto_sw[] = {{"ERR_get_error", NULL},
                                       {"CRYPTO_free", NULL},
                                       {"ERR_clear_error", NULL},
                                       {NULL, NULL}};
-#else
+#else /* OPENSSL_API_1_1 */
+/* OpenSSL <1.1 */
 
 #define SSL_free (*(void (*)(SSL *))ssl_sw[0].ptr)
 #define SSL_accept (*(int (*)(SSL *))ssl_sw[1].ptr)
