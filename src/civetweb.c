@@ -319,6 +319,7 @@ __cyg_profile_func_exit(void *this_fn, void *call_site)
 /* Some ANSI #includes are not available on Windows CE */
 #if !defined(_WIN32_WCE) && !defined(__ZEPHYR__)
 #include <errno.h>
+#include <err.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <stdlib.h>
@@ -1608,9 +1609,11 @@ static void mg_snprintf(const struct mg_connection *conn,
 
 /* mg_init_library counter */
 static int mg_init_library_called = 0;
+static int mg_download_init_called = 0;
 
 #if !defined(NO_SSL)
 static int mg_ssl_initialized = 0;
+static int ssl_initialized = 0; /* basic SSL init done, ready for mg_download */
 #endif
 
 static pthread_key_t sTlsKey; /* Thread local storage index */
@@ -2866,6 +2869,7 @@ struct mg_connection {
 	struct socket client;   /* Connected client */
 	time_t conn_birth_time; /* Time (wall clock) when connection was
 	                         * established */
+	const char *clienthost; /* host name for SSL verification, not owned by connection */
 #if defined(USE_SERVER_STATS)
 	time_t conn_close_time; /* Time (wall clock) when connection was
 	                         * closed (or 0 if still open) */
@@ -5423,7 +5427,7 @@ mg_stat(const struct mg_connection *conn,
 		 * runtime,
 		 * so every mg_fopen call may return different data */
 		/* last_modified = conn->phys_ctx.start_time;
-		 * May be used it the data does not change during runtime. This
+		 * May be used if the data does not change during runtime. This
 		 * allows
 		 * browser caching. Since we do not know, we have to assume the file
 		 * in memory may change. */
@@ -15941,6 +15945,7 @@ initialize_ssl(char *ebuf, size_t ebuf_len)
 	SSL_load_error_strings();
 #endif
 
+	ssl_initialized = 1;
 	return 1;
 }
 
@@ -17037,9 +17042,11 @@ mg_connect_client_impl(const struct mg_client_options *client_options,
 		            NULL, /* No truncation check for ebuf */
 		            ebuf,
 		            ebuf_len,
-		            "Can not create mutex");
+					"Can not create mutex: %s", strerror(err), NULL);
 #if !defined(NO_SSL)
-		SSL_CTX_free(conn->dom_ctx->ssl_ctx);
+		if (use_ssl) {
+			SSL_CTX_free(conn->dom_ctx->ssl_ctx);
+		}
 #endif
 		closesocket(sock);
 		mg_free(conn);
@@ -17789,6 +17796,28 @@ mg_get_response(struct mg_connection *conn,
 }
 
 
+
+static int mg_download_init(int use_ssl, char *ebuf, size_t ebuf_len)
+{
+	#if !defined(_WIN32)
+	if (!mg_download_init_called) {
+		/* mg_download[_secure] must be safe to call w/o initializing library first,
+		 * so make sure the global pthread_mutex_attr is set
+		 */
+		pthread_mutexattr_init(&pthread_mutex_attr);
+		pthread_mutexattr_settype(&pthread_mutex_attr, PTHREAD_MUTEX_RECURSIVE);
+		mg_download_init_called = 1;
+	}
+	#endif
+	if (use_ssl && !ssl_initialized) {
+		if (!initialize_ssl(ebuf, ebuf_len)) {
+			return 0; /*  error */
+		}
+}
+	return 1; /* successfully initialized for calling mg_download */
+}
+
+
 struct mg_connection *
 mg_download(const char *host,
             int port,
@@ -17802,6 +17831,9 @@ mg_download(const char *host,
 	va_list ap;
 	int i;
 	int reqerr;
+
+	/* make sure everything is initialized we need for downloading */
+	if (!mg_download_init(use_ssl, ebuf, ebuf_len)) return NULL;
 
 	if (ebuf_len > 0) {
 		ebuf[0] = '\0';
@@ -17844,6 +17876,281 @@ mg_download(const char *host,
 	va_end(ap);
 	return conn;
 }
+
+
+/*	Digest realm="Simulated VZug Test Device vzug/vzug", nonce="7V4cT0BMBQA=009c37264d0fa0beb3c4d1f826663ddd2263f567", algorithm=MD5, qop="auth" */
+#define NONCE_MAX_SZ 256
+
+/*	Parsed WWW-Authenticate header (including buffer) */
+struct wah {
+	char *realm, *domain, *nonce, *opaque, *algorithm, *stale, *qop;
+	int nc;
+	char new_nonce[NONCE_MAX_SZ];
+	size_t buflen;
+	char buf[1]; /*	 actual size of memory block will be larger */
+};
+
+/*	Return 1 on success. Allocates and returns wah structure on success, frees previous wah first. */
+static int parse_wwwauth_header(struct mg_connection *conn, struct wah **wahP) {
+	char *name, *value, *s;
+	const char *wwwauth_header;
+	size_t bl;
+
+	if (!wahP) return 0;
+	if ((wwwauth_header = mg_get_header(conn, "WWW-Authenticate")) == NULL ||
+			mg_strncasecmp(wwwauth_header, "Digest ", 7) != 0) {
+		return 0;
+	}
+	if (*wahP) mg_free(*wahP);
+	bl = strlen(wwwauth_header)-7+1;
+	*wahP = mg_malloc(sizeof(struct wah)+bl);
+	(void) memset(*wahP, 0, sizeof(struct wah));
+	(*wahP)->buflen = bl;
+
+	/*	Make modifiable copy of the auth header */
+	(void) mg_strlcpy((*wahP)->buf, wwwauth_header + 7, (*wahP)->buflen);
+	s = (*wahP)->buf;
+
+	/*	Parse authorization header */
+	for (;;) {
+		/*	Gobble initial spaces */
+		while (isspace(* (unsigned char *) s)) {
+			s++;
+		}
+		name = skip_quoted(&s, "=", " ", 0);
+		/*	Value is either quote-delimited, or ends at first comma or space. */
+		if (s[0] == '\"') {
+			s++;
+			value = skip_quoted(&s, "\"", " ", '\\');
+			if (s[0] == ',') {
+				s++;
+			}
+		} else {
+			value = skip_quoted(&s, ", ", " ", 0);	/*	IE uses commas, FF uses spaces */
+		}
+		if (*name == '\0') {
+			break;
+		}
+
+		if (!strcmp(name, "realm")) {
+			(*wahP)->realm = value;
+		} else if (!strcmp(name, "domain")) {
+			(*wahP)->domain = value;
+		} else if (!strcmp(name, "nonce")) {
+			(*wahP)->nonce = value;
+		} else if (!strcmp(name, "opaque")) {
+			(*wahP)->opaque = value;
+		} else if (!strcmp(name, "algorithm")) {
+			(*wahP)->algorithm = value;
+		} else if (!strcmp(name, "stale")) {
+			(*wahP)->stale = value;
+		} else if (!strcmp(name, "qop")) {
+			(*wahP)->qop = value;
+		}
+	}
+	return 1;
+}
+
+
+/*	Return 1 on success. Always initializes the wah structure. */
+static int parse_authinfo_nextnonce(struct mg_connection *conn, char *buf, size_t buf_size) {
+	char *name, *value, *s;
+	const char *authinfo_header;
+	char abuf[MG_BUF_LEN];
+
+	if ((authinfo_header = mg_get_header(conn, "Authentication-Info")) == NULL) {
+		return 0;
+	}
+
+	/*	Make modifiable copy of the auth header */
+	(void) mg_strlcpy(abuf, authinfo_header, MG_BUF_LEN);
+	s = abuf;
+
+	/*	Parse authorization header */
+	for (;;) {
+		/*	Gobble initial spaces */
+		while (isspace(* (unsigned char *) s)) {
+			s++;
+		}
+		name = skip_quoted(&s, "=", " ", 0);
+		/*	Value is either quote-delimited, or ends at first comma or space. */
+		if (s[0] == '\"') {
+			s++;
+			value = skip_quoted(&s, "\"", " ", '\\');
+			if (s[0] == ',') {
+				s++;
+}
+		} else {
+			value = skip_quoted(&s, ", ", " ", 0);	/*	IE uses commas, FF uses spaces */
+		}
+		if (*name == '\0') {
+			break;
+		}
+
+		if (!strcmp(name, "nextnonce")) {
+			mg_strlcpy(buf, value, buf_size);
+			return 1;
+		}
+	}
+	/*	nextnonce not found */
+	return 0;
+}
+
+
+
+int create_authorization_header(struct wah *wah,
+								const char *uri,
+								const char *method,
+								const char *username,
+								const char *password,
+								char *buf,
+								size_t buf_size)
+{
+	char ha1[32 + 1];
+	char ha2[32 + 1];
+	char response[32 + 1];
+	char nc[12];
+	char cnonce[12];
+	size_t n;
+
+	if (
+		!uri || !method || !username || !password ||
+		!wah->realm || !wah->nonce || !wah->qop || mg_strcasestr(wah->qop, "auth")==0
+	) {
+		return 0;
+	}
+
+	sprintf(cnonce, "%ld", (unsigned long) time(NULL));
+	wah->nc++;
+	sprintf(nc, "%08X", wah->nc);
+
+	mg_md5(ha1, username, ":", wah->realm, ":", password, NULL);
+	mg_md5(ha2, method, ":", uri, NULL);
+	mg_md5(response, ha1, ":", wah->nonce, ":", nc,
+				 ":", cnonce, ":", wah->qop, ":", ha2, NULL);
+
+	mg_snprintf(NULL, NULL, buf, buf_size,
+		"Authorization: Digest"
+		" username=\"%s\""
+		", realm=\"%s\""
+		", nonce=\"%s\""
+		", uri=\"%s\""
+		", response=\"%s\""
+		", algorithm=\"MD5\""
+		", cnonce=\"%s\""
+		", nc=%s"
+		", qop=\"auth\"", /*  regardless of what server requests, we just support this */
+		username,
+		wah->realm,
+		wah->nonce,
+		uri,
+		response,
+		cnonce,
+		nc
+	);
+	n = strlen(buf);
+	if (wah->opaque) {
+		mg_snprintf(NULL, NULL, buf+n, buf_size-n, ", opaque=\"%s\"", wah->opaque);
+		n = strlen(buf);
+	}
+	mg_snprintf(NULL, NULL, buf+n, buf_size-n, "\r\n");
+	return 1;
+}
+
+
+
+
+
+struct mg_connection *
+mg_download_secure(const struct mg_client_options *client_options,
+				   int use_ssl,
+				   const char *method, const char *requesturi,
+				   const char *username, const char *password, void **opaqueauthP,
+				   char *ebuf, size_t ebuf_len,
+				   const char *fmt, ...)
+{
+	struct mg_connection *conn;
+	char *authorization = NULL;
+	int reused_auth = 0;
+	struct wah *wah = NULL;
+	char *reqText = NULL;
+	int httperr = 0;
+	size_t reqLen = 0;
+	va_list ap;
+	va_start(ap, fmt);
+
+	/* make sure everything is initialized we need for downloading */
+	if (!mg_download_init(use_ssl, ebuf, ebuf_len)) return NULL;
+
+	/*	if we already have www-auth infos from previous request, use it */
+	if (opaqueauthP && *opaqueauthP) {
+		wah = (struct wah *)(*opaqueauthP);
+		*opaqueauthP = NULL; /*	 take ownership for now */
+		if (!authorization) authorization = mg_malloc(MG_BUF_LEN);
+		create_authorization_header(wah, requesturi, method, username, password, authorization, MG_BUF_LEN);
+		reused_auth = 1;
+	}
+	while (1) {
+		ebuf[0] = '\0';
+		/*	produce main message (so it will be sent with a single mg_printf/mg_write below) */
+		reqText = NULL;
+		reqLen = alloc_vprintf(&reqText, NULL, 0, fmt, ap);
+		if ((conn = mg_connect_client_impl(client_options, use_ssl, ebuf, ebuf_len)) == NULL) {
+		} else if (
+			mg_printf(conn, "%s %s HTTP/1.1\r\nHost: %s\r\n%s%s", method, requesturi, client_options->host, authorization ? authorization : "", reqText) <= 0
+		) {
+			mg_snprintf(conn, NULL, ebuf, ebuf_len, "%s", "Error sending request");
+		} else {
+			get_response(conn, ebuf, ebuf_len, &httperr);
+		}
+		if (reqText) { mg_free(reqText); reqText = NULL; }
+		if (ebuf[0] != '\0' && conn != NULL) {
+			mg_close_connection(conn);
+			conn = NULL;
+		}
+		if (httperr!=0) {
+			mg_snprintf(conn, NULL, ebuf, ebuf_len, "Error parsing response: %d", httperr);
+			mg_close_connection(conn);
+			conn = NULL;
+		}
+		if (conn) {
+			/*	check for http auth */
+			if (conn->response_info.status_code==401 && username && password && (!authorization || reused_auth)) {
+				/*	401 and we have user/pw and we haven't tried auth yet */
+				if (parse_wwwauth_header(conn, &wah)) {
+					mg_close_connection(conn);
+					conn = NULL;
+					if (!authorization) authorization = mg_malloc(MG_BUF_LEN);
+					if (create_authorization_header(wah, requesturi, method, username, password, authorization, MG_BUF_LEN)) {
+						/*	try again with auth */
+						reused_auth = 0; /*	 if this fails, do not retry */
+						continue;
+					}
+				}
+			}
+		}
+		break;
+	}
+	if (authorization) mg_free(authorization);
+	if (wah && conn) {
+		if (opaqueauthP) {
+			/*	keep auth info for next request */
+			*opaqueauthP = wah; /*	pass ownership back */
+			if (parse_authinfo_nextnonce(conn, (char *)&(wah->new_nonce), NONCE_MAX_SZ)) {
+				wah->nonce = (char *)&(wah->new_nonce);
+			}
+		}
+		else {
+			/*	one-time use, forget auth info */
+			mg_free(wah); /*  nobody to take ownership, free it */
+		}
+	}
+	return conn;
+}
+
+
+
+
 
 
 struct websocket_client_thread_data {
